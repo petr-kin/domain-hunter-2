@@ -1,0 +1,7 @@
+name = "domain-hunter"
+compatibility_date = "2024-12-01"
+pages_build_output_dir = "dist"
+
+[[kv_namespaces]]
+binding = "DOMAIN_CACHE"
+id = "placeholder"
