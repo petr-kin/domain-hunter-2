@@ -1,19 +1,9 @@
 import React, { useState, useRef, useMemo, useCallback, useEffect } from 'react';
-import { DomainResult, DomainStatus, GeneratorConfig, VerificationStatus } from './types';
+import { DomainResult, DomainStatus, GeneratorConfig } from './types';
 import { generateDomains } from './services/generatorService';
 import { exportToJSON, exportToCSV, copyToClipboard } from './services/exportService';
 import { FilterPanel } from './components/FilterPanel';
 import { DomainItem } from './components/DomainItem';
-
-// Delays per TLD (most RDAP servers rate limit)
-const TLD_DELAYS: Record<string, number> = {
-  cz: 5000,   // 5 seconds - CZ.NIC rate limits aggressively
-  com: 500,   // 500ms - Verisign
-  app: 2000,  // 2 seconds - Google rate limits
-  ai: 500,
-  io: 500,
-};
-const DEFAULT_DELAY = 500;
 
 type ViewFilter = 'all' | 'available' | 'taken';
 
@@ -55,7 +45,6 @@ export default function App() {
   };
 
   const scanRef = useRef(false);
-  const abortControllerRef = useRef<AbortController | null>(null);
   const isInitialLoad = useRef(true);
 
   // Load saved data on mount
@@ -116,6 +105,7 @@ export default function App() {
     scanRef.current = true;
 
     const unknownDomains = domains.filter((d) => d.status === DomainStatus.Unknown);
+    const domainNames = unknownDomains.map((d) => d.name);
 
     let checkedCount = domains.filter(
       (d) => d.status !== DomainStatus.Unknown && d.status !== DomainStatus.Checking
@@ -123,75 +113,79 @@ export default function App() {
     let availableCount = domains.filter((d) => d.status === DomainStatus.Available).length;
     let takenCount = domains.filter((d) => d.status === DomainStatus.Taken).length;
 
-    for (const domain of unknownDomains) {
-      if (!scanRef.current) break;
+    // Mark all unknown as checking
+    setDomains((prev) =>
+      prev.map((d) =>
+        d.status === DomainStatus.Unknown
+          ? { ...d, status: DomainStatus.Checking }
+          : d
+      )
+    );
 
-      const domainName = domain.name;
-      const tld = domainName.split('.').pop()?.toLowerCase() || '';
-
-      // Mark as checking
-      setDomains((prev) =>
-        prev.map((d) => (d.name === domainName ? { ...d, status: DomainStatus.Checking } : d))
-      );
-
-      let status: DomainStatus = DomainStatus.Error;
-
-      try {
-        // RDAP endpoints via proxy (avoids rate limiting)
-        // Note: .ai and .io use DNS fallback (no reliable RDAP)
-        const rdapEndpoints: Record<string, string> = {
-          cz: '/api/rdap/cz/',
-          com: '/api/rdap/com/',
-          app: '/api/rdap/app/',
-        };
-
-        if (rdapEndpoints[tld]) {
-          let retries = 3;
-          let response: Response | null = null;
-
-          while (retries > 0) {
-            response = await fetch(`${rdapEndpoints[tld]}${domainName}`);
-            if (response.status !== 503 && response.status !== 429) break;
-            retries--;
-            if (retries > 0) {
-              console.log(`Rate limited on ${domainName}, waiting 15s... (${retries} retries left)`);
-              await new Promise(r => setTimeout(r, 15000));
-            }
-          }
-
-          status = response?.status === 200 ? DomainStatus.Taken :
-                   response?.status === 404 ? DomainStatus.Available :
-                   DomainStatus.Error;
-        } else {
-          // Fallback to DNS for TLDs without RDAP (.io, etc)
-          const response = await fetch(`https://dns.google/resolve?name=${domainName}&type=NS`);
-          const data = await response.json();
-          status = data.Status === 3 ? DomainStatus.Available : DomainStatus.Taken;
-        }
-      } catch (err) {
-        console.error(`Error checking ${domainName}:`, err);
-        status = DomainStatus.Error;
-      }
-
-      // Update result
-      setDomains((prev) =>
-        prev.map((d) => (d.name === domainName ? { ...d, status, checkedAt: Date.now() } : d))
-      );
-
-      checkedCount++;
-      if (status === DomainStatus.Available) availableCount++;
-      if (status === DomainStatus.Taken) takenCount++;
-
-      setProgress({
-        checked: checkedCount,
-        total: domains.length,
-        available: availableCount,
-        taken: takenCount,
+    try {
+      const response = await fetch('/api/check/stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ domains: domainNames }),
       });
 
-      // Delay before next request (slower for rate-limited TLDs)
-      const delay = TLD_DELAYS[tld] || DEFAULT_DELAY;
-      await new Promise((resolve) => setTimeout(resolve, delay));
+      if (!response.ok || !response.body) {
+        throw new Error('Stream failed');
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (scanRef.current) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const json = line.slice(6);
+          try {
+            const event = JSON.parse(json);
+            if (event.done) break;
+
+            const status =
+              event.status === 'AVAILABLE' ? DomainStatus.Available :
+              event.status === 'TAKEN' ? DomainStatus.Taken :
+              DomainStatus.Error;
+
+            setDomains((prev) =>
+              prev.map((d) =>
+                d.name === event.domain
+                  ? { ...d, status, checkedAt: Date.now() }
+                  : d
+              )
+            );
+
+            checkedCount++;
+            if (status === DomainStatus.Available) availableCount++;
+            if (status === DomainStatus.Taken) takenCount++;
+
+            setProgress({
+              checked: checkedCount,
+              total: domains.length,
+              available: availableCount,
+              taken: takenCount,
+            });
+          } catch {
+            // skip malformed line
+          }
+        }
+      }
+
+      if (!scanRef.current) {
+        reader.cancel();
+      }
+    } catch (err) {
+      console.error('Scan error:', err);
     }
 
     setIsScanning(false);
@@ -200,42 +194,7 @@ export default function App() {
 
   const stopScan = useCallback(() => {
     scanRef.current = false;
-    abortControllerRef.current?.abort();
-    abortControllerRef.current = null;
     setIsScanning(false);
-  }, []);
-
-  const handleStatusChange = useCallback((name: string, status: DomainStatus) => {
-    setDomains((prev) => {
-      const next = prev.map((d) =>
-        d.name === name ? { ...d, status, checkedAt: Date.now() } : d
-      );
-      return next;
-    });
-    setProgress((prev) => ({
-      ...prev,
-      checked: prev.checked + 1,
-      available: prev.available + (status === DomainStatus.Available ? 1 : 0),
-      taken: prev.taken + (status === DomainStatus.Taken ? 1 : 0),
-    }));
-  }, []);
-
-  const handleVerificationChange = useCallback((name: string, verification: VerificationStatus) => {
-    setDomains((prev) => {
-      const next = prev.map((d) =>
-        d.name === name ? { ...d, verification } : d
-      );
-      return next;
-    });
-
-    // If verification failed, update progress counters
-    if (verification === VerificationStatus.VerifyFailed) {
-      setProgress((prev) => ({
-        ...prev,
-        available: Math.max(0, prev.available - 1),
-        taken: prev.taken + 1,
-      }));
-    }
   }, []);
 
   const displayDomains = useMemo(() => {
@@ -286,7 +245,7 @@ export default function App() {
             </h1>
           </div>
           <p className="text-[10px] text-slate-600 mt-1.5 tracking-wide">
-            v1.1.0 · Premium Domain Discovery
+            v2.0.0 · Premium Domain Discovery
           </p>
         </div>
 
@@ -401,7 +360,7 @@ export default function App() {
             </button>
           )}
           <p className="text-[10px] text-slate-700 text-center leading-relaxed">
-            DNS via Google DoH · AI by Gemini 2.5 Flash
+            Authoritative RDAP · AI by Gemini 2.5 Flash
             <br />
             Auto-saves to browser · NXDOMAIN ≠ guaranteed
           </p>
@@ -493,7 +452,7 @@ export default function App() {
             <>
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-3">
                 {displayDomains.map((item) => (
-                  <DomainItem key={item.name} item={item} onStatusChange={handleStatusChange} onVerificationChange={handleVerificationChange} />
+                  <DomainItem key={item.name} item={item} />
                 ))}
               </div>
               {displayDomains.length === 0 && (
