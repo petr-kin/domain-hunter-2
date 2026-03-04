@@ -42,6 +42,15 @@ export interface AIAnalysis {
   reasoning: string;
 }
 
+// API request types
+export interface CheckRequest {
+  domains: string[];
+}
+
+export interface AnalyzeRequest {
+  domain: string;
+}
+
 // API response types (from Worker backend)
 export interface CheckResult {
   domain: string;
