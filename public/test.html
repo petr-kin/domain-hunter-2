@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+<head><title>RDAP Test</title></head>
+<body>
+<h1>RDAP Test</h1>
+<button onclick="testFetch()">Test Fetch</button>
+<pre id="result"></pre>
+<script>
+async function testFetch() {
+  const domain = 'ag.cz';
+  const url = `https://rdap.nic.cz/domain/${domain}`;
+  document.getElementById('result').textContent = 'Fetching ' + url + '...\n';
+  try {
+    const response = await fetch(url);
+    document.getElementById('result').textContent += 'Status: ' + response.status + '\n';
+    const text = await response.text();
+    document.getElementById('result').textContent += 'Response: ' + text.substring(0, 200);
+  } catch (error) {
+    document.getElementById('result').textContent += 'Error: ' + error.message + '\n' + error.stack;
+  }
+}
+</script>
+</body>
+</html>
