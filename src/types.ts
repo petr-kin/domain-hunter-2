@@ -51,3 +51,17 @@ export interface AIAnalysis {
   niche: string[];
   reasoning: string;
 }
+
+// API response types (from Worker backend)
+export interface CheckResult {
+  domain: string;
+  status: 'AVAILABLE' | 'TAKEN' | 'ERROR';
+  cached: boolean;
+}
+
+export interface StreamEvent {
+  domain?: string;
+  status?: 'AVAILABLE' | 'TAKEN' | 'ERROR';
+  cached?: boolean;
+  done?: boolean;
+}
