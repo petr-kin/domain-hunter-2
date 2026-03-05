@@ -42,17 +42,26 @@ export async function dnsPreFilter(domain: string): Promise<boolean | null> {
 export async function checkRdap(domain: string): Promise<DomainStatus> {
   const tld = domain.split('.').pop()?.toLowerCase() || '';
   const endpoint = RDAP_ENDPOINTS[tld] || RDAP_FALLBACK;
-  try {
-    const response = await fetch(`${endpoint}${domain}`, {
-      signal: AbortSignal.timeout(10000),
-      headers: { 'Accept': 'application/rdap+json' },
-    });
-    if (response.status === 200) return 'TAKEN';
-    if (response.status === 404) return 'AVAILABLE';
-    return 'ERROR';
-  } catch {
-    return 'ERROR';
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const response = await fetch(`${endpoint}${domain}`, {
+        signal: AbortSignal.timeout(10000),
+        headers: { 'Accept': 'application/rdap+json' },
+      });
+      if (response.status === 200) return 'TAKEN';
+      if (response.status === 404 || response.status === 400) return 'AVAILABLE';
+      if (response.status === 429 && attempt === 0) {
+        await new Promise((r) => setTimeout(r, 1000));
+        continue;
+      }
+      return 'ERROR';
+    } catch {
+      if (attempt === 0) continue;
+      return 'ERROR';
+    }
   }
+  return 'ERROR';
 }
 
 export async function cacheResult(kv: KVNamespace, domain: string, status: DomainStatus): Promise<void> {

@@ -98,6 +98,76 @@ export default function App() {
     setProgress({ checked: 0, total: initialDomains.length, available: 0, taken: 0 });
   }, [config]);
 
+  const BATCH_SIZE = 50;
+
+  const processStream = async (
+    domainNames: string[],
+    counters: { checked: number; available: number; taken: number },
+    total: number
+  ) => {
+    const response = await fetch('/api/check/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ domains: domainNames }),
+    });
+
+    if (!response.ok || !response.body) {
+      throw new Error('Stream failed');
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (scanRef.current) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const json = line.slice(6);
+        try {
+          const event = JSON.parse(json);
+          if (event.done) break;
+
+          const status =
+            event.status === 'AVAILABLE' ? DomainStatus.Available :
+            event.status === 'TAKEN' ? DomainStatus.Taken :
+            DomainStatus.Error;
+
+          setDomains((prev) =>
+            prev.map((d) =>
+              d.name === event.domain
+                ? { ...d, status, checkedAt: Date.now() }
+                : d
+            )
+          );
+
+          counters.checked++;
+          if (status === DomainStatus.Available) counters.available++;
+          if (status === DomainStatus.Taken) counters.taken++;
+
+          setProgress({
+            checked: counters.checked,
+            total,
+            available: counters.available,
+            taken: counters.taken,
+          });
+        } catch {
+          // skip malformed line
+        }
+      }
+    }
+
+    if (!scanRef.current) {
+      reader.cancel();
+    }
+  };
+
   const startScan = useCallback(async () => {
     if (domains.length === 0) return;
 
@@ -107,11 +177,13 @@ export default function App() {
     const unknownDomains = domains.filter((d) => d.status === DomainStatus.Unknown);
     const domainNames = unknownDomains.map((d) => d.name);
 
-    let checkedCount = domains.filter(
-      (d) => d.status !== DomainStatus.Unknown && d.status !== DomainStatus.Checking
-    ).length;
-    let availableCount = domains.filter((d) => d.status === DomainStatus.Available).length;
-    let takenCount = domains.filter((d) => d.status === DomainStatus.Taken).length;
+    const counters = {
+      checked: domains.filter(
+        (d) => d.status !== DomainStatus.Unknown && d.status !== DomainStatus.Checking
+      ).length,
+      available: domains.filter((d) => d.status === DomainStatus.Available).length,
+      taken: domains.filter((d) => d.status === DomainStatus.Taken).length,
+    };
 
     // Mark all unknown as checking
     setDomains((prev) =>
@@ -123,66 +195,11 @@ export default function App() {
     );
 
     try {
-      const response = await fetch('/api/check/stream', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ domains: domainNames }),
-      });
-
-      if (!response.ok || !response.body) {
-        throw new Error('Stream failed');
-      }
-
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-
-      while (scanRef.current) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-          const json = line.slice(6);
-          try {
-            const event = JSON.parse(json);
-            if (event.done) break;
-
-            const status =
-              event.status === 'AVAILABLE' ? DomainStatus.Available :
-              event.status === 'TAKEN' ? DomainStatus.Taken :
-              DomainStatus.Error;
-
-            setDomains((prev) =>
-              prev.map((d) =>
-                d.name === event.domain
-                  ? { ...d, status, checkedAt: Date.now() }
-                  : d
-              )
-            );
-
-            checkedCount++;
-            if (status === DomainStatus.Available) availableCount++;
-            if (status === DomainStatus.Taken) takenCount++;
-
-            setProgress({
-              checked: checkedCount,
-              total: domains.length,
-              available: availableCount,
-              taken: takenCount,
-            });
-          } catch {
-            // skip malformed line
-          }
-        }
-      }
-
-      if (!scanRef.current) {
-        reader.cancel();
+      // Send domains in batches to avoid Worker timeout
+      for (let i = 0; i < domainNames.length; i += BATCH_SIZE) {
+        if (!scanRef.current) break;
+        const batch = domainNames.slice(i, i + BATCH_SIZE);
+        await processStream(batch, counters, domains.length);
       }
     } catch (err) {
       console.error('Scan error:', err);

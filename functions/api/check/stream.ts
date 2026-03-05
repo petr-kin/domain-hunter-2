@@ -4,6 +4,8 @@ interface Env {
   DOMAIN_CACHE: KVNamespace;
 }
 
+const CONCURRENCY = 10;
+
 export const onRequestPost: PagesFunction<Env> = async (context) => {
   let domains: string[];
   try {
@@ -23,12 +25,20 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
 
   const stream = new ReadableStream({
     async start(controller) {
-      for (const domain of domains) {
-        try {
-          const result = await checkDomain(kv, domain);
+      // Process domains in concurrent batches
+      for (let i = 0; i < domains.length; i += CONCURRENCY) {
+        const batch = domains.slice(i, i + CONCURRENCY);
+        const results = await Promise.all(
+          batch.map(async (domain) => {
+            try {
+              return await checkDomain(kv, domain);
+            } catch {
+              return { domain, status: 'ERROR' as const, cached: false };
+            }
+          })
+        );
+        for (const result of results) {
           controller.enqueue(encoder.encode(`data: ${JSON.stringify(result)}\n\n`));
-        } catch {
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ domain, status: 'ERROR', cached: false })}\n\n`));
         }
       }
       controller.enqueue(encoder.encode('data: {"done":true}\n\n'));
