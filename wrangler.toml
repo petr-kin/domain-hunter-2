@@ -7,4 +7,5 @@ ENVIRONMENT = "production"
 
 [[kv_namespaces]]
 binding = "DOMAIN_CACHE"
-id = "placeholder"
+id = "bf0673cf5c8549009b78d8834cda81de"
+preview_id = "94fa28d927ec4e2fbd1c4c206e9aae1b"
